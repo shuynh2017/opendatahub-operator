@@ -1,9 +1,11 @@
 package e2e_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +43,16 @@ const (
 
 	// Container image versions
 	llmInferenceSimulatorImage = "ghcr.io/llm-d/llm-d-inference-sim:v0.5.1"
+
+	// Load test constants
+	loadGeneratorJobName   = "wva-load-test"
+	loadGeneratorImage     = "quay.io/curl/curl:8.11.1"
+	loadTargetServiceURL   = "http://sim-llama-kserve-workload-svc:8000/v1/chat/completions"
+	loadTotalRequests      = 200
+	loadBatchSize          = 10
+	loadMaxTokens          = 500
+	loadModelID            = "Qwen/Qwen2.5-7B-Instruct"
+	workloadDeploymentName = "sim-llama-kserve-workload"
 )
 
 type WVATestCtx struct {
@@ -49,6 +61,7 @@ type WVATestCtx struct {
 	originalMonitoringConfig    string // Original cluster-monitoring-config
 	originalDeploymentReplicas  map[string]int32
 	originalStatefulSetReplicas map[string]int32
+	initialReplicaCount int
 }
 
 func wvaTestSuite(t *testing.T) {
@@ -114,18 +127,33 @@ func wvaTestSuite(t *testing.T) {
 	// Test phase - actual tests that exercise WVA functionality
 	t.Log("=== WVA Test Phase ===")
 
-	t.Run("WVA infrastructure validation", func(t *testing.T) {
-		t.Log("Validating WVA infrastructure setup")
-
-		t.Log("✓ KEDA operator is installed")
-		t.Log("✓ LLMInferenceService deployment successful")
-		t.Log("✓ Monitoring configured")
-		t.Log("✓ VariantAutoscaling and ScaledObject created")
-
-		t.Log("Infrastructure validation complete")
-		t.Log("TODO: Add actual autoscaling tests in follow-up PR (replica transitions, sustained load)")
+	t.Cleanup(func() {
+		cleanupCmd := exec.Command("oc", "delete", "job", loadGeneratorJobName,
+			"-n", wvaTestNamespace, "--ignore-not-found=true")
+		cleanupCmd.CombinedOutput()
 	})
 
+	testSteps := []TestCase{
+		{"Record initial replica count", componentCtx.RecordInitialReplicaCount},
+		{"Verify single inference request succeeds", componentCtx.VerifySingleInferenceRequest},
+		{"Deploy load generator job", componentCtx.DeployLoadGeneratorJob},
+		{"Verify load generator is running", componentCtx.VerifyLoadGeneratorRunning},
+		{"Verify vLLM metrics increase under load", componentCtx.VerifyVLLMMetricsUnderLoad},
+		{"Verify WVA recommends scale-up", componentCtx.VerifyWVARecommendsScaleUp},
+		{"Verify WVA desired replicas in Prometheus", componentCtx.VerifyWVADesiredReplicasInPrometheus},
+		{"Verify pods scale up beyond initial count", componentCtx.VerifyPodsScaleUp},
+		{"Delete load generator job", componentCtx.DeleteLoadGeneratorJob},
+		{"Verify pods scale down to min replicas", componentCtx.VerifyPodsScaleDown},
+	}
+
+	for _, step := range testSteps {
+		t.Run(step.name, func(t *testing.T) {
+			step.testFn(t)
+		})
+		if t.Failed() {
+			t.Fatal("Test phase failed, stopping test execution")
+		}
+	}
 	t.Log("=== WVA Test Phase Complete ===")
 }
 
@@ -279,6 +307,17 @@ func (tc *WVATestCtx) CleanupExistingResources(t *testing.T) {
 	secretOutput, secretErr := tc.execCommandWithLogging(t, "Delete KEDA Secret", deleteSecretCmd)
 	if secretErr != nil {
 		t.Logf("Warning: Failed to delete Secret: %v\nOutput: %s", secretErr, secretOutput)
+	}
+
+	// Delete load generator job from previous test runs
+	t.Log("Deleting existing load generator job")
+	deleteJobCmd := exec.Command("oc", "delete", "job", loadGeneratorJobName,
+		"-n", wvaTestNamespace,
+		"--ignore-not-found=true",
+		"--timeout=1m")
+	jobOutput, jobErr := tc.execCommandWithLogging(t, "Delete existing load generator job", deleteJobCmd)
+	if jobErr != nil {
+		t.Logf("Warning: Failed to delete load generator job: %v\nOutput: %s", jobErr, jobOutput)
 	}
 
 	// Restore cluster to original state
@@ -2296,4 +2335,446 @@ func (tc *WVATestCtx) RestoreClusterState(t *testing.T) {
 	}
 
 	t.Log("Cluster state restoration completed")
+}
+
+func (tc *WVATestCtx) RecordInitialReplicaCount(t *testing.T) {
+	t.Helper()
+
+	t.Log("Recording initial replica count before applying load")
+
+	cmd := exec.Command("oc", "get", "deployment", workloadDeploymentName,
+		"-n", wvaTestNamespace,
+		"-o", "jsonpath={.status.readyReplicas}")
+	output, err := tc.execCommandWithLogging(t, "Get initial ready replicas", cmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully query deployment %s readyReplicas\nActual: Command failed\nError: %v", workloadDeploymentName, err)
+
+	count := strings.TrimSpace(output)
+	tc.g.Expect(count).NotTo(BeEmpty(),
+		"Expected: Non-empty readyReplicas value\nActual: Empty")
+
+	parsed, parseErr := strconv.Atoi(count)
+	tc.g.Expect(parseErr).NotTo(HaveOccurred(),
+		"Expected: Integer readyReplicas\nActual: '%s'\nError: %v", count, parseErr)
+	tc.g.Expect(parsed).To(Equal(1),
+		"Expected: readyReplicas = 1 (configured minReplicas) before load test\nActual: %d\n"+
+			"If this fails, the system is not at the expected idle baseline", parsed)
+
+	tc.initialReplicaCount = parsed
+	t.Logf("✅ Initial replica count: %d (matches configured minReplicas)", tc.initialReplicaCount)
+}
+
+func (tc *WVATestCtx) VerifySingleInferenceRequest(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying single inference request succeeds before sending burst load")
+
+	tc.g.Eventually(func(g Gomega) {
+		curlCmd := exec.Command("oc", "run", "inference-check", "--rm", "-i", "--restart=Never",
+			"--image="+loadGeneratorImage,
+			"-n", wvaTestNamespace,
+			"--", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+			"--max-time", "30",
+			"-X", "POST", loadTargetServiceURL,
+			"-H", "Content-Type: application/json",
+			"-d", fmt.Sprintf(`{"model":"%s","messages":[{"role":"user","content":"Hello"}],"max_tokens":10}`, loadModelID))
+
+		output, err := curlCmd.CombinedOutput()
+		httpCode := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully run inference check pod\nActual: Failed\nError: %v\nOutput: %s", err, httpCode)
+		g.Expect(httpCode).To(ContainSubstring("200"),
+			"Expected: HTTP 200 from inference endpoint\nActual: HTTP %s\nEndpoint: %s", httpCode, loadTargetServiceURL)
+
+		t.Logf("Inference endpoint returned HTTP %s", httpCode)
+	}).WithTimeout(2*time.Minute).WithPolling(10*time.Second).Should(Succeed(),
+		"Single inference request should return HTTP 200 within 2 minutes")
+
+	t.Log("✅ Inference endpoint is responding")
+}
+
+func (tc *WVATestCtx) DeployLoadGeneratorJob(t *testing.T) {
+	t.Helper()
+
+	t.Log("Deploying load generator job")
+
+	jobYAML := fmt.Sprintf(`apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    test-resource: "true"
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        test-resource: "true"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load-generator
+          image: %s
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Burst load generator starting..."
+              echo "Sending %d requests to %s in batches of %d"
+              BASE_URL=$(echo "%s" | sed 's|/v1/.*||')
+              HEALTH_URL="${BASE_URL}/v1/models"
+              MAX_RETRIES=24
+              RETRY_DELAY=5
+              CONNECTED=false
+              for i in $(seq 1 $MAX_RETRIES); do
+                if curl -s -o /dev/null -w "%%{http_code}" "$HEALTH_URL" 2>/dev/null | grep -q 200; then
+                  echo "Connection test passed on attempt $i"
+                  CONNECTED=true
+                  break
+                fi
+                echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+              done
+              if [ "$CONNECTED" != "true" ]; then
+                echo "ERROR: Cannot connect to service after $MAX_RETRIES attempts"
+                exit 1
+              fi
+              SUCCESS_DIR=$(mktemp -d /tmp/success.XXXXXX)
+              FAIL_DIR=$(mktemp -d /tmp/fail.XXXXXX)
+              SENT=0
+              while [ $SENT -lt %d ]; do
+                for i in $(seq 1 %d); do
+                  if [ $SENT -ge %d ]; then break; fi
+                  (HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 180 -X POST %s \
+                    -H "Content-Type: application/json" \
+                    -d '{"model":"%s","messages":[{"role":"user","content":"Write a detailed explanation of machine learning algorithms."}],"max_tokens":%d}' 2>/dev/null)
+                  if [ "$HTTP_CODE" = "200" ]; then
+                    touch "$SUCCESS_DIR/$SENT.$$"
+                  else
+                    touch "$FAIL_DIR/$SENT.$$"
+                  fi) &
+                  SENT=$((SENT + 1))
+                done
+                echo "Sent $SENT / %d requests..."
+                sleep 0.5
+              done
+              wait || true
+              OK=$(ls "$SUCCESS_DIR" 2>/dev/null | wc -l)
+              FAIL=$(ls "$FAIL_DIR" 2>/dev/null | wc -l)
+              rm -rf "$SUCCESS_DIR" "$FAIL_DIR"
+              echo "Load generation complete: $OK succeeded, $FAIL failed out of $SENT total"
+              MIN_OK=$((SENT / 10))
+              if [ "$MIN_OK" -lt 1 ]; then MIN_OK=1; fi
+              if [ "$OK" -lt "$MIN_OK" ]; then
+                echo "ERROR: Only $OK of $SENT requests succeeded (need at least $MIN_OK)"
+                exit 1
+              fi
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi`,
+		loadGeneratorJobName, wvaTestNamespace, loadGeneratorImage,
+		loadTotalRequests, loadTargetServiceURL, loadBatchSize,
+		loadTargetServiceURL,
+		loadTotalRequests, loadBatchSize, loadTotalRequests, loadTargetServiceURL,
+		loadModelID, loadMaxTokens,
+		loadTotalRequests)
+
+	tmpFile := fmt.Sprintf("/tmp/%s-job.yaml", loadGeneratorJobName)
+	writeCmd := exec.Command("sh", "-c", fmt.Sprintf("cat > %s << 'ENDOFFILE'\n%s\nENDOFFILE", tmpFile, jobYAML))
+	_, err := tc.execCommandWithLogging(t, "Write load generator YAML to temp file", writeCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully write Job YAML to temp file\nActual: Failed\nError: %v", err)
+
+	applyCmd := exec.Command("oc", "apply", "-f", tmpFile)
+	_, err = tc.execCommandWithLogging(t, "Apply load generator job", applyCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully create load generator Job\nActual: Failed\nError: %v", err)
+
+	t.Logf("✅ Load generator job %s deployed", loadGeneratorJobName)
+}
+
+func (tc *WVATestCtx) VerifyLoadGeneratorRunning(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying load generator pod is running")
+
+	tc.g.Eventually(func(g Gomega) {
+		cmd := exec.Command("oc", "get", "pods",
+			"-n", wvaTestNamespace,
+			"-l", fmt.Sprintf("job-name=%s", loadGeneratorJobName),
+			"-o", "jsonpath={.items[0].status.phase}")
+		output, err := cmd.CombinedOutput()
+		phase := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query load generator pod phase\nActual: Failed\nError: %v\nOutput: %s", err, phase)
+		g.Expect(phase).To(Or(Equal("Running"), Equal("Succeeded")),
+			"Expected: Load generator pod phase 'Running' or 'Succeeded'\nActual: '%s'", phase)
+
+		t.Logf("Load generator pod phase: %s", phase)
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"Load generator pod should reach Running or Succeeded state within 2 minutes")
+
+	t.Log("✅ Load generator is active")
+}
+
+func (tc *WVATestCtx) VerifyVLLMMetricsUnderLoad(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying vLLM metrics increase under load")
+
+	tokenCmd := exec.Command("oc", "whoami", "-t")
+	token, err := tc.execCommandWithLogging(t, "Get authentication token", tokenCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
+
+	thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
+		"-n", "openshift-monitoring",
+		"-o", "jsonpath={.spec.host}")
+	thanosHost, err := tc.execCommandWithLogging(t, "Get Thanos querier route", thanosCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
+
+	query := fmt.Sprintf("vllm:num_requests_running{namespace=\"%s\"}", wvaTestNamespace)
+	url := fmt.Sprintf("https://%s/api/v1/query", thanosHost)
+
+	tc.g.Eventually(func(g Gomega) {
+		curlCmd := exec.Command("curl", "-sk", "-G",
+			"-H", fmt.Sprintf("Authorization: Bearer %s", token),
+			url,
+			"--data-urlencode", fmt.Sprintf("query=%s", query))
+
+		curlOutput, err := curlCmd.CombinedOutput()
+		result := string(curlOutput)
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query Prometheus\nActual: Failed\nError: %v\nResponse: %s", err, result)
+		g.Expect(result).To(ContainSubstring(`"status":"success"`),
+			"Expected: Prometheus response with status 'success'\nActual: %s", result)
+
+		var promResp struct {
+			Data struct {
+				Result []struct {
+					Value []json.RawMessage `json:"value"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		g.Expect(json.Unmarshal(curlOutput, &promResp)).To(Succeed(),
+			"Expected: Valid JSON from Prometheus\nActual: %s", result)
+		g.Expect(promResp.Data.Result).NotTo(BeEmpty(),
+			"Expected: Non-empty results for vllm:num_requests_running under load\nQuery: %s\nResponse: %s",
+			query, result)
+
+		var totalRunning float64
+		for i, series := range promResp.Data.Result {
+			g.Expect(len(series.Value)).To(BeNumerically(">=", 2),
+				"Expected: Series %d to have [timestamp, value]\nActual: %v", i, series.Value)
+			var valStr string
+			g.Expect(json.Unmarshal(series.Value[1], &valStr)).To(Succeed(),
+				"Expected: Parseable metric value in series %d\nActual: %s", i, result)
+			val, parseErr := strconv.ParseFloat(valStr, 64)
+			g.Expect(parseErr).NotTo(HaveOccurred(),
+				"Expected: Numeric metric value in series %d\nActual: '%s'", i, valStr)
+			totalRunning += val
+		}
+		g.Expect(totalRunning).To(BeNumerically(">", 0),
+			"Expected: Total num_requests_running > 0 across all %d series under load\nActual: %.0f",
+			len(promResp.Data.Result), totalRunning)
+
+		t.Logf("vLLM num_requests_running = %.0f across %d series (confirming active load)",
+			totalRunning, len(promResp.Data.Result))
+	}).WithTimeout(3*time.Minute).WithPolling(15*time.Second).Should(Succeed(),
+		"vLLM metrics should show active requests within 3 minutes of load start")
+
+	t.Log("✅ vLLM metrics confirmed > 0 under load")
+}
+
+func (tc *WVATestCtx) VerifyWVARecommendsScaleUp(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying WVA recommends scale-up under load")
+
+	tc.g.Eventually(func(g Gomega) {
+		cmd := exec.Command("oc", "get", "variantautoscaling", "sim-llama-kserve-va",
+			"-n", wvaTestNamespace,
+			"-o", "jsonpath={.status.desiredOptimizedAlloc.numReplicas}")
+		output, err := cmd.CombinedOutput()
+		result := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query VariantAutoscaling status\nActual: Failed\nError: %v\nOutput: %s", err, result)
+		g.Expect(result).NotTo(BeEmpty(),
+			"Expected: Non-empty desiredOptimizedAlloc.numReplicas\nActual: Empty")
+
+		var desiredReplicas int
+		_, parseErr := fmt.Sscanf(result, "%d", &desiredReplicas)
+		g.Expect(parseErr).NotTo(HaveOccurred(),
+			"Expected: Integer value for numReplicas\nActual: '%s'\nError: %v", result, parseErr)
+		g.Expect(desiredReplicas).To(BeNumerically(">", tc.initialReplicaCount),
+			"Expected: WVA desired replicas > %d (initial)\nActual: %d", tc.initialReplicaCount, desiredReplicas)
+
+		t.Logf("WVA desired replicas: %d (initial was %d)", desiredReplicas, tc.initialReplicaCount)
+	}).WithTimeout(3*time.Minute).WithPolling(10*time.Second).Should(Succeed(),
+		"WVA should recommend scale-up within 3 minutes")
+
+	t.Log("✅ WVA detected saturation and recommends scale-up")
+}
+
+func (tc *WVATestCtx) VerifyWVADesiredReplicasInPrometheus(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying wva_desired_replicas metric is visible in Prometheus")
+
+	tokenCmd := exec.Command("oc", "whoami", "-t")
+	token, err := tc.execCommandWithLogging(t, "Get authentication token", tokenCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
+
+	thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
+		"-n", "openshift-monitoring",
+		"-o", "jsonpath={.spec.host}")
+	thanosHost, err := tc.execCommandWithLogging(t, "Get Thanos querier route", thanosCmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
+
+	query := fmt.Sprintf(`wva_desired_replicas{namespace="%s"}`, tc.AppsNamespace)
+	url := fmt.Sprintf("https://%s/api/v1/query", thanosHost)
+
+	tc.g.Eventually(func(g Gomega) {
+		curlCmd := exec.Command("curl", "-sk", "-G",
+			"-H", fmt.Sprintf("Authorization: Bearer %s", token),
+			url,
+			"--data-urlencode", fmt.Sprintf("query=%s", query))
+
+		curlOutput, err := curlCmd.CombinedOutput()
+		result := string(curlOutput)
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query Prometheus\nActual: Failed\nError: %v\nResponse: %s", err, result)
+		g.Expect(result).To(ContainSubstring(`"status":"success"`),
+			"Expected: Prometheus response with status 'success'\nActual: %s", result)
+
+		var promResp struct {
+			Data struct {
+				Result []struct {
+					Value []json.RawMessage `json:"value"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		g.Expect(json.Unmarshal(curlOutput, &promResp)).To(Succeed(),
+			"Expected: Valid JSON from Prometheus\nActual: %s", result)
+		g.Expect(promResp.Data.Result).NotTo(BeEmpty(),
+			"Expected: Non-empty results for wva_desired_replicas\nQuery: %s\nResponse: %s",
+			query, result)
+
+		var valStr string
+		g.Expect(json.Unmarshal(promResp.Data.Result[0].Value[1], &valStr)).To(Succeed(),
+			"Expected: Parseable metric value\nActual: %s", result)
+		val, parseErr := strconv.ParseFloat(valStr, 64)
+		g.Expect(parseErr).NotTo(HaveOccurred(),
+			"Expected: Numeric metric value\nActual: '%s'", valStr)
+		g.Expect(val).To(BeNumerically(">", float64(tc.initialReplicaCount)),
+			"Expected: wva_desired_replicas > %d in Prometheus (not just in CR status)\nActual: %.0f",
+			tc.initialReplicaCount, val)
+
+		t.Logf("wva_desired_replicas = %.0f in Prometheus (confirming WVA metrics pipeline)", val)
+	}).WithTimeout(2*time.Minute).WithPolling(10*time.Second).Should(Succeed(),
+		"wva_desired_replicas should be > %d in Prometheus within 2 minutes", tc.initialReplicaCount)
+
+	t.Log("✅ WVA desired replicas confirmed in Prometheus")
+}
+
+func (tc *WVATestCtx) VerifyPodsScaleUp(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying pods scale up beyond initial count")
+
+	tc.g.Eventually(func(g Gomega) {
+		cmd := exec.Command("oc", "get", "deployment", workloadDeploymentName,
+			"-n", wvaTestNamespace,
+			"-o", "jsonpath={.status.readyReplicas}")
+		output, err := cmd.CombinedOutput()
+		result := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query deployment %s readyReplicas\nActual: Failed\nError: %v\nOutput: %s",
+			workloadDeploymentName, err, result)
+		g.Expect(result).NotTo(BeEmpty(),
+			"Expected: Non-empty readyReplicas\nActual: Empty")
+
+		readyReplicas, parseErr := strconv.Atoi(result)
+		g.Expect(parseErr).NotTo(HaveOccurred(),
+			"Expected: Integer readyReplicas\nActual: '%s'", result)
+		g.Expect(readyReplicas).To(BeNumerically(">", tc.initialReplicaCount),
+			"Expected: readyReplicas > %d (initial)\nActual: %d", tc.initialReplicaCount, readyReplicas)
+
+		t.Logf("Deployment %s readyReplicas: %d (initial was %d)", workloadDeploymentName, readyReplicas, tc.initialReplicaCount)
+	}).WithTimeout(5*time.Minute).WithPolling(10*time.Second).Should(Succeed(),
+		"Deployment %s readyReplicas should exceed %d within 5 minutes", workloadDeploymentName, tc.initialReplicaCount)
+
+	t.Log("✅ Pods scaled up successfully")
+}
+
+func (tc *WVATestCtx) DeleteLoadGeneratorJob(t *testing.T) {
+	t.Helper()
+
+	t.Log("Deleting load generator job to stop traffic")
+
+	cmd := exec.Command("oc", "delete", "job", loadGeneratorJobName,
+		"-n", wvaTestNamespace)
+	_, err := tc.execCommandWithLogging(t, "Delete load generator job", cmd)
+	tc.g.Expect(err).NotTo(HaveOccurred(),
+		"Expected: Successfully delete load generator job (required before scale-down check)\nActual: Failed\nError: %v", err)
+
+	tc.g.Eventually(func(g Gomega) {
+		checkCmd := exec.Command("oc", "get", "pods",
+			"-n", wvaTestNamespace,
+			"-l", fmt.Sprintf("job-name=%s", loadGeneratorJobName),
+			"-o", "jsonpath={.items[*].metadata.name}")
+		output, err := checkCmd.CombinedOutput()
+		result := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(result).To(BeEmpty(),
+			"Expected: Load generator pods fully terminated\nActual: Still running: %s", result)
+	}).WithTimeout(1*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"Load generator pods should terminate within 1 minute")
+
+	t.Logf("✅ Load generator job %s deleted and pods terminated", loadGeneratorJobName)
+}
+
+func (tc *WVATestCtx) VerifyPodsScaleDown(t *testing.T) {
+	t.Helper()
+
+	t.Log("Verifying pods scale down to initial replica count after load stops")
+
+	tc.g.Eventually(func(g Gomega) {
+		cmd := exec.Command("oc", "get", "deployment", workloadDeploymentName,
+			"-n", wvaTestNamespace,
+			"-o", "jsonpath={.status.readyReplicas}")
+		output, err := cmd.CombinedOutput()
+		result := strings.TrimSpace(string(output))
+
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully query deployment %s readyReplicas\nActual: Failed\nError: %v\nOutput: %s",
+			workloadDeploymentName, err, result)
+		g.Expect(result).NotTo(BeEmpty(),
+			"Expected: Non-empty readyReplicas\nActual: Empty")
+
+		readyReplicas, parseErr := strconv.Atoi(result)
+		g.Expect(parseErr).NotTo(HaveOccurred(),
+			"Expected: Integer readyReplicas\nActual: '%s'", result)
+		g.Expect(readyReplicas).To(Equal(tc.initialReplicaCount),
+			"Expected: readyReplicas = %d (initial/minReplicas) after load stops\nActual: %d", tc.initialReplicaCount, readyReplicas)
+
+		t.Logf("Deployment %s readyReplicas: %d", workloadDeploymentName, readyReplicas)
+	}).WithTimeout(10*time.Minute).WithPolling(15*time.Second).Should(Succeed(),
+		"Deployment %s readyReplicas should return to %d within 10 minutes", workloadDeploymentName, tc.initialReplicaCount)
+
+	t.Log("✅ Pods scaled down to initial replica count")
 }
