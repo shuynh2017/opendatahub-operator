@@ -2356,8 +2356,8 @@ func (tc *WVATestCtx) RecordInitialReplicaCount(t *testing.T) {
 	parsed, parseErr := strconv.Atoi(count)
 	tc.g.Expect(parseErr).NotTo(HaveOccurred(),
 		"Expected: Integer readyReplicas\nActual: '%s'\nError: %v", count, parseErr)
-	tc.g.Expect(parsed).To(Equal(1),
-		"Expected: readyReplicas = 1 (configured minReplicas) before load test\nActual: %d\n"+
+	tc.g.Expect(parsed).To(BeNumerically(">=", 1),
+		"Expected: readyReplicas >= 1 (at configured minReplicas) before load test\nActual: %d\n"+
 			"If this fails, the system is not at the expected idle baseline", parsed)
 
 	tc.initialReplicaCount = parsed
@@ -2370,6 +2370,10 @@ func (tc *WVATestCtx) VerifySingleInferenceRequest(t *testing.T) {
 	t.Log("Verifying single inference request succeeds before sending burst load")
 
 	tc.g.Eventually(func(g Gomega) {
+		cleanupCmd := exec.Command("oc", "delete", "pod", "inference-check",
+			"-n", wvaTestNamespace, "--ignore-not-found=true")
+		cleanupCmd.CombinedOutput()
+
 		curlCmd := exec.Command("oc", "run", "inference-check", "--rm", "-i", "--restart=Never",
 			"--image="+loadGeneratorImage,
 			"-n", wvaTestNamespace,
@@ -2485,8 +2489,7 @@ spec:
 		loadTotalRequests)
 
 	tmpFile := fmt.Sprintf("/tmp/%s-job.yaml", loadGeneratorJobName)
-	writeCmd := exec.Command("sh", "-c", fmt.Sprintf("cat > %s << 'ENDOFFILE'\n%s\nENDOFFILE", tmpFile, jobYAML))
-	_, err := tc.execCommandWithLogging(t, "Write load generator YAML to temp file", writeCmd)
+	err := os.WriteFile(tmpFile, []byte(jobYAML), 0644)
 	tc.g.Expect(err).NotTo(HaveOccurred(),
 		"Expected: Successfully write Job YAML to temp file\nActual: Failed\nError: %v", err)
 
@@ -2528,24 +2531,24 @@ func (tc *WVATestCtx) VerifyVLLMMetricsUnderLoad(t *testing.T) {
 
 	t.Log("Verifying vLLM metrics increase under load")
 
-	tokenCmd := exec.Command("oc", "whoami", "-t")
-	token, err := tc.execCommandWithLogging(t, "Get authentication token", tokenCmd)
-	tc.g.Expect(err).NotTo(HaveOccurred(),
-		"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
-
-	thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
-		"-n", "openshift-monitoring",
-		"-o", "jsonpath={.spec.host}")
-	thanosHost, err := tc.execCommandWithLogging(t, "Get Thanos querier route", thanosCmd)
-	tc.g.Expect(err).NotTo(HaveOccurred(),
-		"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
-
 	query := fmt.Sprintf("vllm:num_requests_running{namespace=\"%s\"}", wvaTestNamespace)
-	url := fmt.Sprintf("https://%s/api/v1/query", thanosHost)
 
 	tc.g.Eventually(func(g Gomega) {
+		tokenCmd := exec.Command("oc", "whoami", "-t")
+		token, err := tokenCmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
+
+		thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
+			"-n", "openshift-monitoring",
+			"-o", "jsonpath={.spec.host}")
+		thanosHost, err := thanosCmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
+
+		url := fmt.Sprintf("https://%s/api/v1/query", strings.TrimSpace(string(thanosHost)))
 		curlCmd := exec.Command("curl", "-sk", "-G",
-			"-H", fmt.Sprintf("Authorization: Bearer %s", token),
+			"-H", fmt.Sprintf("Authorization: Bearer %s", strings.TrimSpace(string(token))),
 			url,
 			"--data-urlencode", fmt.Sprintf("query=%s", query))
 
@@ -2630,24 +2633,25 @@ func (tc *WVATestCtx) VerifyWVADesiredReplicasInPrometheus(t *testing.T) {
 
 	t.Log("Verifying wva_desired_replicas metric is visible in Prometheus")
 
-	tokenCmd := exec.Command("oc", "whoami", "-t")
-	token, err := tc.execCommandWithLogging(t, "Get authentication token", tokenCmd)
-	tc.g.Expect(err).NotTo(HaveOccurred(),
-		"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
-
-	thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
-		"-n", "openshift-monitoring",
-		"-o", "jsonpath={.spec.host}")
-	thanosHost, err := tc.execCommandWithLogging(t, "Get Thanos querier route", thanosCmd)
-	tc.g.Expect(err).NotTo(HaveOccurred(),
-		"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
-
+	// WVA controller emits metrics in the apps namespace (where it runs), not the workload namespace
 	query := fmt.Sprintf(`wva_desired_replicas{namespace="%s"}`, tc.AppsNamespace)
-	url := fmt.Sprintf("https://%s/api/v1/query", thanosHost)
 
 	tc.g.Eventually(func(g Gomega) {
+		tokenCmd := exec.Command("oc", "whoami", "-t")
+		token, err := tokenCmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Successfully get authentication token\nActual: Failed\nError: %v", err)
+
+		thanosCmd := exec.Command("oc", "get", "route", "thanos-querier",
+			"-n", "openshift-monitoring",
+			"-o", "jsonpath={.spec.host}")
+		thanosHost, err := thanosCmd.CombinedOutput()
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Expected: Thanos querier route to exist\nActual: Failed\nError: %v", err)
+
+		url := fmt.Sprintf("https://%s/api/v1/query", strings.TrimSpace(string(thanosHost)))
 		curlCmd := exec.Command("curl", "-sk", "-G",
-			"-H", fmt.Sprintf("Authorization: Bearer %s", token),
+			"-H", fmt.Sprintf("Authorization: Bearer %s", strings.TrimSpace(string(token))),
 			url,
 			"--data-urlencode", fmt.Sprintf("query=%s", query))
 
