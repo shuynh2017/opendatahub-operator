@@ -15,7 +15,7 @@ You can enable distributed tracing for your llm-d model deployments to gain visi
 - You have installed the `Red Hat Connectivity Link` operator from OperatorHub. For more information on how to do this, refer to the [Red Hat official documentation](https://docs.redhat.com/en/documentation/red_hat_connectivity_link/1.3/html/installing_on_openshift_container_platform/index) on installing it.
 
 - You have the `Red Hat OpenShift Service Mesh 3` operator installed in your cluster. You should have this by default on any OpenShift cluster version `4.20` or later.
-
+  
 - You have installed {productname-long} {vernum}.
 
 - A `DataScienceClusterInitialization` (DSCI) and `DataScienceCluster` (DSC) exist in your cluster, enabling the `llmisvc-controller-manager` and `kserve-controller-manager`. The `DataScienceClusterInitialization` gets created by the Red Hat OpenShift-AI operator out of the box for you. This is a sample excerpt from the `DataScienceCluster` manifest:
@@ -362,36 +362,13 @@ metadata:
   name: distributed-tracing-llama
   namespace: distributed-tracing
 spec:
+ tracing:
+    exporterEndpoint: "http://otel-collector:4317"
+    sampler: "parentbased_traceidratio"
+    samplerArg: "0.05"
+    exporter: "otlp"
   router:
     scheduler:
-      template:
-        containers:
-          - name: main
-            args:
-              - --tracing=true
-            env:
-              - name: OTEL_SERVICE_NAME
-                value: "gateway-api-inference-extension"
-              - name: OTEL_EXPORTER_OTLP_ENDPOINT
-                value: "http://otel-collector:4317"
-              - name: OTEL_TRACES_EXPORTER
-                value: "otlp"
-              - name: OTEL_RESOURCE_ATTRIBUTES_NODE_NAME
-                valueFrom:
-                  fieldRef:
-                    apiVersion: v1
-                    fieldPath: spec.nodeName
-              - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAME
-                valueFrom:
-                  fieldRef:
-                    apiVersion: v1
-                    fieldPath: metadata.name
-              - name: OTEL_RESOURCE_ATTRIBUTES
-                value: "k8s.namespace.name=$(NAMESPACE),k8s.node.name=$(OTEL_RESOURCE_ATTRIBUTES_NODE_NAME),k8s.pod.name=$(OTEL_RESOURCE_ATTRIBUTES_POD_NAME)"
-              - name: OTEL_TRACES_SAMPLER
-                value: "parentbased_traceidratio"
-              - name: OTEL_TRACES_SAMPLER_ARG
-                value: "0.1"
     route: {}
     gateway:
       refs:
@@ -403,24 +380,8 @@ spec:
   template:
     containers:
       - name: main
-        image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.4.0-ea.2-1774939203
+        image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.5.0-ea.1-1780065492
         imagePullPolicy: Always
-        args:
-          - --otlp-traces-endpoint
-          - "http://otel-collector:4317"
-          - --collect-detailed-traces
-          - "all"
-        env:
-          - name: OTEL_SERVICE_NAME
-            value: "vllm-decode"
-          - name: OTEL_EXPORTER_OTLP_ENDPOINT
-            value: "http://otel-collector:4317"
-          - name: OTEL_TRACES_EXPORTER
-            value: "otlp"
-          - name: OTEL_TRACES_SAMPLER
-            value: "parentbased_traceidratio"
-          - name: OTEL_TRACES_SAMPLER_ARG
-            value: "0.1"
         resources:
           limits:
             cpu: '4'
@@ -441,15 +402,9 @@ oc get llminferenceservice distributed-tracing-llama -n distributed-tracing -w
 
 Some important pieces to note about this configuration:
 
-1. **Scheduler tracing** — The `--tracing=true` arg on the scheduler container enables trace propagation through the inference scheduler (the `gateway-api-inference-extension` component). The `OTEL_*` environment variables configure where and how traces are exported.
+1. **Sampling rate** — Both the scheduler and vLLM are configured with `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.05`, meaning 5% of requests will be traced. This is appropriate for development and demo environments. For high-traffic production deployments, consider reducing this to 1-5%.
 
-2. **vLLM tracing** — The `--otlp-traces-endpoint` and `--collect-detailed-traces all` args on the vLLM container enable the model server to emit detailed internal spans (tokenization, model execution, sampling, etc.) to the OTel Collector.
-
-3. **Sampling rate** — Both the scheduler and vLLM are configured with `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.1`, meaning 10% of requests will be traced. This is appropriate for development and demo environments. For high-traffic production deployments, consider reducing this to 1-5%.
-
-4. **Service names** — The scheduler reports as `gateway-api-inference-extension` and vLLM reports as `vllm-decode`. These names appear in the Jaeger UI as separate services, allowing you to filter and correlate spans across the request lifecycle.
-
-5. **OTLP endpoint** — Both components point at `otel-collector:4317`, the service created by the OpenTelemetry operator in step 5. This is the gRPC endpoint of the OTel Collector.
+2. **OTLP endpoint** — the service `otel-collector:4317` created by the OpenTelemetry operator in step 5. This is the gRPC endpoint of the OTel Collector.
 
 ## Verifying Distributed Tracing
 
