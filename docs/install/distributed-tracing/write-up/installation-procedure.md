@@ -465,42 +465,6 @@ You should see spans from both the inference scheduler and vLLM, showing the ful
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | Jaeger UI shows 0 services | OTel Collector can't reach Tempo | Check collector logs: `oc logs -l app.kubernetes.io/name=otel-collector -n distributed-tracing`. If you see `connection refused` errors, restart the collector pod: `oc delete pod -l app.kubernetes.io/name=otel-collector -n distributed-tracing` |
-| vLLM pod crashes with `AttributeError: type object 'Any' has no attribute 'SERVER'` | Missing OpenTelemetry SDK packages in the vLLM image | The RHAIIS image may not ship the full OpenTelemetry SDK. Use an init container to install `opentelemetry-sdk` and `opentelemetry-exporter-otlp` into a shared volume, and set `PYTHONPATH` to include it. See the [workaround section](#workaround-missing-opentelemetry-sdk-in-the-vllm-image) below |
 | `missing tenant header` in Jaeger UI | Multi-tenancy is enabled on the Tempo instance | Disable multi-tenancy in the `TempoMonolithic` spec, or access Tempo directly bypassing the gateway |
-| Traces appear for `vllm-decode` but not `gateway-api-inference-extension` (or vice versa) | Only one component has tracing configured | Verify both the scheduler (`--tracing=true`) and vLLM (`--otlp-traces-endpoint`) have tracing enabled in the LLMISVC spec |
 | `GatewayPreconditionNotMet` on LLMISVC | llmisvc controller started before Connectivity Link CRDs were available | Restart the llmisvc controller pod: `oc rollout restart deployment llmisvc-controller-manager -n redhat-ods-applications` |
 | Gateway shows `PROGRAMMED=False` | Service type is `LoadBalancer` but no LB controller exists | Change the gateway ConfigMap service type to `ClusterIP` |
-
-### Workaround: missing OpenTelemetry SDK in the vLLM image
-
-If the RHAIIS vLLM image does not include the full OpenTelemetry SDK (causing the `SpanKind.SERVER` crash described above), you can work around this by adding an init container that installs the missing packages into a shared volume:
-
-```yaml
-# Add to spec.template in the LLMInferenceService:
-  template:
-    initContainers:
-      - name: install-otel-sdk
-        image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.4.0-ea.2-1774939203
-        command: ["pip", "install", "--target=/otel-packages", "--quiet",
-                  "opentelemetry-sdk", "opentelemetry-exporter-otlp"]
-        volumeMounts:
-          - name: otel-packages
-            mountPath: /otel-packages
-    volumes:
-      - name: otel-packages
-        emptyDir: {}
-    containers:
-      - name: main
-        # ... existing container spec ...
-        volumeMounts:
-          - name: otel-packages
-            mountPath: /otel-packages
-        env:
-          - name: PYTHONPATH
-            value: "/otel-packages"
-          # ... other env vars ...
-```
-
-This installs `opentelemetry-sdk` and `opentelemetry-exporter-otlp` into an `emptyDir` volume that is shared with the main container via `PYTHONPATH`. The init container does not require a GPU and uses the same base image for Python compatibility.
-
-**NOTE:** This workaround requires network access to PyPI from the init container. It will not work in air-gapped environments. For air-gapped clusters, build a custom vLLM image that includes the OpenTelemetry packages.
