@@ -8,7 +8,7 @@ NAMESPACE="distributed-tracing"
 GATEWAY_SVC="distributed-tracing-gateway-data-science-gateway-class"
 LOCAL_PORT=9443
 REMOTE_PORT=443
-NUM_REQUESTS=13
+NUM_REQUESTS=50
 
 TOKEN=$(oc whoami -t)
 
