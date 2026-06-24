@@ -1,6 +1,6 @@
 # Enable Distributed Tracing for llm-d deployments
 
-You can enable distributed tracing for your llm-d model deployments to gain visibility into the full request lifecycle — from the gateway, through the inference scheduler, and into the vLLM model server. Traces are collected using the Red Hat build of OpenTelemetry and stored in the Red Hat build of Tempo, with a Jaeger UI for visualization.
+You can enable distributed tracing for your llm-d model deployments to gain visibility into the full request lifecycle — from the gateway, through the inference scheduler, and into the vLLM model server. Traces are collected and stored in the Red Hat build of Tempo, with a Jaeger UI for visualization.
 
 ## Prerequisites
 
@@ -44,64 +44,17 @@ spec:
 The distributed tracing pipeline consists of three components:
 
 1. **vLLM model server** — Instrumented with OpenTelemetry to emit trace spans for each inference request. The `--otlp-traces-endpoint` and `--collect-detailed-traces` flags enable this.
-2. **OpenTelemetry Collector** — Receives traces from vLLM (and the inference scheduler), filters out noise (e.g., `/metrics` scraping spans), batches them, and forwards them to Tempo.
-3. **Tempo** — Stores traces and exposes a Jaeger UI for querying and visualizing them.
+2. **Tempo** — Receives traces from vLLM (and the inference scheduler), stores traces and exposes a Jaeger UI for querying and visualizing them.
 
 ```
-vLLM (--otlp-traces-endpoint) ──► OTel Collector ──► Tempo ──► Jaeger UI
+vLLM (--otlp-traces-endpoint) ──► Tempo ──► Jaeger UI
                                     ▲
 Inference Scheduler (--tracing) ────┘
 ```
 
 ## Procedure
 
-### Step 1 — Install the Red Hat build of OpenTelemetry operator
-
-The OpenTelemetry operator provides the `OpenTelemetryCollector` CRD, which we use to deploy a managed collector instance. Install it from the `redhat-operators` catalog:
-
-```bash
-oc apply -f - <<'EOF'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: openshift-opentelemetry-operator
----
-apiVersion: operators.coreos.com/v1
-kind: OperatorGroup
-metadata:
-  name: openshift-opentelemetry-operator
-  namespace: openshift-opentelemetry-operator
-spec:
-  upgradeStrategy: Default
----
-apiVersion: operators.coreos.com/v1alpha1
-kind: Subscription
-metadata:
-  name: opentelemetry-product
-  namespace: openshift-opentelemetry-operator
-spec:
-  channel: stable
-  installPlanApproval: Automatic
-  name: opentelemetry-product
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-EOF
-```
-
-Wait for the operator to be ready:
-
-```bash
-oc get csv -n openshift-opentelemetry-operator -w
-```
-
-You should see the `opentelemetry-operator` CSV reach `Succeeded`:
-
-```console
-NAME                              DISPLAY                           VERSION   REPLACES   PHASE
-opentelemetry-operator.v0.x.x     Red Hat build of OpenTelemetry    0.x.x                Succeeded
-```
-
-### Step 2 — Install the Red Hat build of Tempo operator
+### Step 1 — Install the Red Hat build of Tempo operator
 
 The Tempo operator provides the `TempoMonolithic` CRD, which deploys a single-process Tempo instance suitable for development and demo environments. Install it from the `redhat-operators` catalog:
 
@@ -140,7 +93,7 @@ Wait for the operator to be ready:
 oc get csv -n openshift-tempo-operator -w
 ```
 
-### Step 3 — Create the workload namespace
+### Step 2 — Create the workload namespace
 
 Because we only allow for one inference stack per namespace at this time, we will create the `distributed-tracing` namespace, although this should work for any namespace provided you adjust the manifests accordingly.
 
@@ -155,7 +108,7 @@ namespace/distributed-tracing created
 Now using project "distributed-tracing" on server "https://api.example.com:443".
 ```
 
-### Step 4 — Deploy the Tempo instance
+### Step 3 — Deploy the Tempo instance
 
 Create a `TempoMonolithic` instance in the workload namespace. This stores traces in-memory and exposes a Jaeger UI via an OpenShift Route:
 
@@ -213,77 +166,7 @@ Some things to note about this Tempo setup:
 2. **Jaeger UI** — The `jaegerui.enabled: true` and `jaegerui.route.enabled: true` settings deploy the Jaeger query UI and create an OpenShift Route. You can find the route with `oc get route -n distributed-tracing`.
 3. **Multi-tenancy** — By default multi-tenancy is not enabled. OpenShift will emit a warning about this during creation. Enabling multi-tenancy (`multitenancy.enabled: true`, `mode: openshift`) adds auth to the ingest and query paths, but the Jaeger UI currently does not send the required `X-Scope-OrgID` tenant header, making the UI inaccessible. For demo purposes, leaving multi-tenancy disabled is recommended.
 
-### Step 5 — Deploy the OpenTelemetry Collector
-
-The collector must be deployed **after** Tempo is ready, otherwise its gRPC connection to Tempo will fail and traces will be silently dropped.
-
-Create the `OpenTelemetryCollector` instance:
-
-```bash
-oc apply -f - <<'EOF'
-apiVersion: opentelemetry.io/v1beta1
-kind: OpenTelemetryCollector
-metadata:
-  name: otel
-  namespace: distributed-tracing
-spec:
-  mode: deployment
-  observability:
-    metrics:
-      enableMetrics: true
-  config:
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: "0.0.0.0:4317"
-          http:
-            endpoint: "0.0.0.0:4318"
-    processors:
-      filter/drop-metrics-scraping:
-        error_mode: ignore
-        traces:
-          span:
-            - 'attributes["url.path"] == "/metrics"'
-            - 'attributes["http.route"] == "/metrics"'
-            - name == "GET /metrics"
-            - name == "GET"
-      batch:
-        send_batch_size: 1024
-        timeout: 1s
-    exporters:
-      otlp/tempo:
-        endpoint: "tempo-tracing:4317"
-        tls:
-          insecure: true
-    service:
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: [filter/drop-metrics-scraping, batch]
-          exporters: [otlp/tempo]
-EOF
-```
-
-Verify the collector pod is running:
-
-```bash
-oc get pods -n distributed-tracing -l app.kubernetes.io/name=otel-collector
-```
-
-```console
-NAME                              READY   STATUS    RESTARTS   AGE
-otel-collector-5766fc4494-fdzlb   1/1     Running   0          30s
-```
-
-Some things to note about this collector configuration:
-
-1. **Service name** — The operator creates a `Service` named `<name>-collector`, so naming the resource `otel` produces a service called `otel-collector` on ports `4317` (gRPC) and `4318` (HTTP). This is the endpoint that vLLM and the inference scheduler point their OTLP exporters at.
-2. **Filter processor** — The `filter/drop-metrics-scraping` processor drops trace spans generated by Prometheus scraping the `/metrics` endpoint. These are noise and not useful for debugging inference requests.
-3. **Batch processor** — Batches spans before export to reduce the number of gRPC calls to Tempo.
-4. **Ordering** — If the collector is deployed before Tempo is ready, the gRPC client may cache a failed connection state and silently drop traces even after Tempo comes up. If you suspect this has happened, restart the collector pod: `oc delete pod -n distributed-tracing -l app.kubernetes.io/name=otel-collector`.
-
-### Step 6 — Create the Gateway
+### Step 5 — Create the Gateway
 
 Next we will create a gateway that uses TLS via OpenShift Service Mesh:
 
@@ -350,7 +233,7 @@ distributed-tracing-gateway   data-science-gateway-class             True       
 
 **Note:** We use `ClusterIP` as the service type because not all OpenShift flavours have `LoadBalancer` integration. For accessing the inference endpoint, you can use `kubectl port-forward` (as shown in the verification section) or send requests from a pod inside the cluster.
 
-### Step 7 — Create the LLMInferenceService with tracing enabled
+### Step 6 — Create the LLMInferenceService with tracing enabled
 
 Now we create the `LLMInferenceService` with distributed tracing configured on both the inference scheduler and the vLLM model server:
 
@@ -363,7 +246,7 @@ metadata:
   namespace: distributed-tracing
 spec:
  tracing:
-    exporterEndpoint: "http://otel-collector:4317"
+    exporterEndpoint: "http://tempo-tracing:4317"
     sampler: "parentbased_traceidratio"
     samplerArg: "0.05"
     exporter: "otlp"
@@ -404,7 +287,7 @@ Some important pieces to note about this configuration:
 
 1. **Sampling rate** — Both the scheduler and vLLM are configured with `OTEL_TRACES_SAMPLER=parentbased_traceidratio` and `OTEL_TRACES_SAMPLER_ARG=0.05`, meaning 5% of requests will be traced. This is appropriate for development and demo environments. For high-traffic production deployments, consider reducing this to 1-5%.
 
-2. **OTLP endpoint** — the service `otel-collector:4317` created by the OpenTelemetry operator in step 5. This is the gRPC endpoint of the OTel Collector.
+2. **Tempo endpoint** — the service `tempo-tracing:4317` created by the Tempo operator in step 3. This is the gRPC endpoint of the Tempo Collector.
 
 ## Verifying Distributed Tracing
 
@@ -421,9 +304,9 @@ kubectl port-forward -n distributed-tracing "svc/$GATEWAY_SVC" 9443:443 &
 PF_PID=$!
 sleep 3
 
-# Send requests (at 10% sampling, 13 requests gives ~75% chance of at least one trace)
+# Send requests (at 5% sampling, 26 requests gives ~75% chance of at least one trace)
 TOKEN=$(oc whoami -t)
-for i in $(seq 1 13); do
+for i in $(seq 1 26); do
     HTTP_CODE=$(curl -sk -o /dev/null -w '%{http_code}' \
         --noproxy localhost \
         -H "Authorization: Bearer ${TOKEN}" \
@@ -454,7 +337,7 @@ tempo-tracing-jaegerui   tempo-tracing-jaegerui-distributed-tracing.apps.example
 
 Open the `HOST/PORT` URL in your browser. In the Jaeger UI:
 
-1. Select a service from the **Service** dropdown (e.g., `vllm-decode` or `gateway-api-inference-extension`).
+1. Select a service from the **Service** dropdown (e.g., `inference-server-decode` or `gateway-api-inference-extension`).
 2. Click **Find Traces**.
 3. Click on a trace to expand its span timeline.
 
@@ -464,7 +347,7 @@ You should see spans from both the inference scheduler and vLLM, showing the ful
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Jaeger UI shows 0 services | OTel Collector can't reach Tempo | Check collector logs: `oc logs -l app.kubernetes.io/name=otel-collector -n distributed-tracing`. If you see `connection refused` errors, restart the collector pod: `oc delete pod -l app.kubernetes.io/name=otel-collector -n distributed-tracing` |
+| Jaeger UI shows 0 services | traces can't reach Tempo | Check Tempo logs: `oc logs -l app.kubernetes.io/name=tempo-monolithic -n distributed-tracing -c tempo-query`. If you see `connection refused` errors, restart the Tempo pod: `oc delete pod -l app.kubernetes.io/name=tempo-monolithic -n distributed-tracing` |
 | `missing tenant header` in Jaeger UI | Multi-tenancy is enabled on the Tempo instance | Disable multi-tenancy in the `TempoMonolithic` spec, or access Tempo directly bypassing the gateway |
 | `GatewayPreconditionNotMet` on LLMISVC | llmisvc controller started before Connectivity Link CRDs were available | Restart the llmisvc controller pod: `oc rollout restart deployment llmisvc-controller-manager -n redhat-ods-applications` |
 | Gateway shows `PROGRAMMED=False` | Service type is `LoadBalancer` but no LB controller exists | Change the gateway ConfigMap service type to `ClusterIP` |

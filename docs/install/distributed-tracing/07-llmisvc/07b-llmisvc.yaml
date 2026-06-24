@@ -6,7 +6,7 @@ metadata:
   annotations:
 spec:
   tracing:
-    exporterEndpoint: "http://otel-collector:4317"
+    exporterEndpoint: "http://tempo-tracing:4317"
     sampler: "parentbased_traceidratio"
     samplerArg: "0.05"
     exporter: "otlp"
