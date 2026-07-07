@@ -3,15 +3,15 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-#kubectl apply -f "$DIR/08a-namespace.yaml"
+kubectl apply -f "$DIR/08a-namespace.yaml"
 
 # Create pull secret in the workload namespace for scheduler/sidecar images
 kubectl create secret docker-registry rhoai-operator-pull-secret -n autoscaling-example \
     --from-file=.dockerconfigjson=$HOME/.config/containers/auth.json \
     --dry-run=client -o yaml | kubectl apply -f -
 
-#kubectl apply -f "$DIR/08b-gateway.yaml"
-#kubectl apply -f "$DIR/08c-llmisvc.yaml"
+kubectl apply -f "$DIR/08b-gateway.yaml"
+kubectl apply -f "$DIR/08c-llmisvc.yaml"
 
 # The llmisvc controller creates the SA after the LLMInferenceService is applied.
 # Wait for it, then patch it with the pull secret and restart the pods.
