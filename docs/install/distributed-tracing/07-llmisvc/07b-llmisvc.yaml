@@ -25,7 +25,7 @@ spec:
       - name: main
         # image: quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0-ea.2 # If using Accelerators, use the corresponding inference-image, current latest RHAIIS
         #image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.4.0-ea.2-1774939203 # Official RHAIIS EA2 image
-        image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.5.0-ea.1-1780065492
+        image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.5.0-ea.2-1782953356
         imagePullPolicy: Always
         resources:
           limits:
