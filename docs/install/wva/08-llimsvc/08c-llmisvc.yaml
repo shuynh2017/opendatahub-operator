@@ -31,7 +31,7 @@ spec:
   template:
     containers:
       - name: main
-        image: quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0 # If using Accelerators, use the corresponding inference-image
+        image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.2-1782155603
         env: # DO NOT INCLUDE THIS - for testing only
           - name: HF_OFFLINE_HUB # DO NOT INCLUDE THIS - for testing only
             value: "1" # DO NOT INCLUDE THIS - for testing only
