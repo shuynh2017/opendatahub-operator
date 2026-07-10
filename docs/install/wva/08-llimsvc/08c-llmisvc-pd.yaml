@@ -1,0 +1,192 @@
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata:
+  name: sriov-p2-policy
+  namespace: openshift-sriov-network-operator
+spec:
+  deviceType: netdevice
+  isRdma: true
+  linkType: eth
+  mtu: 9000
+  nicSelector:
+    deviceID: 101d
+    rootDevices:
+      - 0000:5c:00.0
+      - 0000:5c:00.1
+    pfNames:
+      - p2
+    vendor: 15b3
+  nodeSelector:
+    feature.node.kubernetes.io/pci-15b3.present: 'true'
+    feature.node.kubernetes.io/pci-15b3.sriov.capable: 'true'
+    feature.node.kubernetes.io/rdma.available: 'true'
+    feature.node.kubernetes.io/rdma.capable: 'true'
+  numVfs: 8
+  priority: 98
+  resourceName: p2rdma
+---
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetwork
+metadata:
+  name: roce-p2
+  namespace: openshift-sriov-network-operator
+spec:
+  ipam: |-
+    {
+      "type": "whereabouts",
+      "range": "10.0.132.0/24"
+    }
+  logLevel: info
+  networkNamespace: 'autoscaling-example'
+  resourceName: p2rdma
+  spoofChk: "off"
+  trust: "on"
+  linkState: "enable"
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: qwen2-7b-instruct-pd
+  namespace: autoscaling-example
+  annotations:
+    # RoCE network required for KV cache transfer via RDMA
+    k8s.v1.cni.cncf.io/networks: roce-p2
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+    security.opendatahub.io/enable-auth: 'false'
+spec:
+  # Main/decode pool replica count
+  model:
+    uri: hf://Qwen/Qwen2.5-7B-Instruct
+    name: Qwen/Qwen2.5-7B-Instruct
+  labels:
+    inference.optimization/acceleratorName: H100 # If using Accelerators, use the Name of your Accelerator
+  scaling:
+    minReplicas: 1
+    maxReplicas: 5
+    wva:
+      keda:
+        pollingInterval: 5
+        cooldownPeriod: 30
+  router:
+    route: { }
+    gateway: { }
+    scheduler: { }
+  template:
+    # This affinity rule ensures that the KV transfer happens over the RDMA network because if the pods are placed
+    # on the same node it will go over NVLink.
+    #affinity:
+    #  podAntiAffinity:
+    #    preferredDuringSchedulingIgnoredDuringExecution:
+    #    - weight: 100
+    #      podAffinityTerm:
+    #        labelSelector:
+    #          matchExpressions:
+    #          - key: app.kubernetes.io/component
+    #            operator: In
+    #            values:
+    #            - llminferenceservice-workload-prefill
+    #        topologyKey: kubernetes.io/hostname
+    containers:
+      - name: main
+        image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.2-1782155603
+        env:
+          # Enable RDMA for KV cache transfer
+          - name: KSERVE_INFER_ROCE
+            value: "true"
+          # Pod IP for KV transfer side channel
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          # Enable KV cache transfer via NixlConnector (RDMA-based)
+          - name: VLLM_ADDITIONAL_ARGS
+            value: "--kv_transfer_config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}'"
+          # UCX configuration for RDMA transport
+          - name: UCX_PROTO_INFO
+            value: "y"
+          - name: UCX_TLS
+            value: "rc,sm,self,cuda_copy,cuda_ipc"
+        resources:
+          limits:
+            cpu: '4'
+            memory: 32Gi
+            nvidia.com/gpu: "1"
+            rdma/roce_gdr: 1
+          requests:
+            cpu: '2'
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+            rdma/roce_gdr: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTPS
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 30
+          failureThreshold: 5
+  prefill:
+    labels:
+      inference.optimization/acceleratorName: H100 # If using Accelerators, use the Name of your Accelerator
+    # Prefill pool replica count (higher for concurrent prefill requests)
+    scaling:
+      minReplicas: 1
+      maxReplicas: 5
+      wva:
+        keda:
+          pollingInterval: 5
+          cooldownPeriod: 30
+    template:
+      # This affinity rule ensures that the KV transfer happens over the RDMA network because if the pods are placed
+      # on the same node it will go over NVLink
+      #affinity:
+      #  podAntiAffinity:
+      #    preferredDuringSchedulingIgnoredDuringExecution:
+      #    - weight: 100
+      #      podAffinityTerm:
+      #        labelSelector:
+      #          matchExpressions:
+      #          - key: app.kubernetes.io/component
+      #            operator: In
+      #            values:
+      #            - llminferenceservice-workload
+      #        topologyKey: kubernetes.io/hostname
+      containers:
+        - name: main
+          image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.2-1782155603
+          env:
+            - name: KSERVE_INFER_ROCE
+              value: "true"
+            - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: VLLM_ADDITIONAL_ARGS
+              value: "--kv_transfer_config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}'"
+            - name: UCX_PROTO_INFO
+              value: "y"
+            - name: UCX_TLS
+              value: "rc,sm,self,cuda_copy,cuda_ipc"
+          resources:
+            limits:
+              cpu: '4'
+              memory: 32Gi
+              nvidia.com/gpu: "1"
+              rdma/roce_gdr: 1
+            requests:
+              cpu: '2'
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+              rdma/roce_gdr: 1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+              scheme: HTTPS
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 30
+            failureThreshold: 5
