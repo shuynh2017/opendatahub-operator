@@ -1,5 +1,6 @@
 # Scaling P/D (Prefill/Decode)
 
+[DOC TEAM: We should discuss how much of this doc we want to include]
 This document shows an example of scaling an LLMInferenceService with P/D using WVA.
 
 ## Prerequisites
@@ -279,3 +280,29 @@ After running script to send requests to LLMInference service to cause scale up.
 - The following screenshot shows scaling for prefill and decode deployments by selecting both in the `variant` pulldown menu:
   
     [![./images/pd-both.png](./images/pd-both.png)](./images/pd-both.png)
+
+## Comparing SCaling with P/D aware vs w/o PD/ aware
+[DOC TEAM] This section documents the experiment and results. This section should not be in official doc.
+### Setup
+- H100 cluster with 6 GPUS available for the experiment.
+- MaxReplicas is set to 10 (>6) to avoid hitting max replicas.
+- WVA v0.8.0
+- The load test script is not an official benchmark. It just starts a number of threads to send requests.
+- P/D aware is supported by WVA V2 token-based capacity analyzer.
+- P/D not-ware is achieved by manually update WVA code, commenting out code returning `llm-d.ai/role`
+## Experiment
+- The experiment first run for P/D not-aware, and then P/D aware.
+- Here's the sequence of events:
+  [![./images/pd-with-vs-without-aware.png](./images/pd-with-vs-without-aware.png)](./images/pd-with-vs-without-aware.png)
+  - 12:00 - 12:25: P/D not-aware
+  - 12:25 - 12:45: P/D aware
+  - 12:00 - 1 replica for P, 1 replica for D, 1 Mil tokens each.
+  - 12:01 - In `Replica Overview`, P got signal to scale to 5
+  - 12:02 - In `Replica Overview`, D got signal to scale to 3
+  - 12:04 - In `Capacity Breakdown`, shows P has 5 replicas running (5 Mil tokens), while D still only has 1 replica running and 2 pending (recall max of 6 GPUs)
+  - 12:14 - For remaining of the test, P runs with 5 replicas, D runs with 1 replicas. Hence, the `Saturation Utilization` shows the average load among P replicas is much lower than D for the duration of the test.
+  - 12:25 - P/D ware starts
+  - 12:25 - 12:27: `Replica Overview` shows P and D scale signals are fairly close to each other with P tops at 4, D at 5. As opposed to above where P tops at 5 first then D tops at 3.
+  - 12:29 - `Capacity Breakdown` shows both has 3 replicas running (recall max of 6 GPUs). Having similar number of replicas in this experiment is the result of **alternate** scaling one variant and then the other. For remaining of the test, P runs with 3 replicas, D runs with 3 replicas. Hence, the `Saturation Utilization` shows the average load among P replicas is similar to D for the duration of the test.
+## Conclusion
+The experiment above shows when WVA is aware of P/D, it scales them **together** instead of independently which can result replicas and utilization imbalance as shown.

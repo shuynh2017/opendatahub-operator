@@ -1,5 +1,6 @@
 
 # V2 (Token-based Capacity Analyzer)
+[NOTE: this is still needed to be verified - don't include in official doc yet]
 V2 (token-based capacity) analyzer uses the following definitions and calculations for scaling decisions.
 
 ## Supply
