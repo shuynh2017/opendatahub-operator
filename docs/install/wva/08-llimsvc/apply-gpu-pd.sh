@@ -11,22 +11,26 @@ kubectl create secret docker-registry rhoai-operator-pull-secret -n autoscaling-
     --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl apply -f "$DIR/08b-gateway.yaml"
-kubectl apply -f "$DIR/08c-llmisvc.yaml"
+#kubectl apply -f "$DIR/08c-llmisvc-pd.yaml"
+kubectl apply -f "$DIR/08c-llmisvc-pd-not-work.yaml"
 
 # The llmisvc controller creates the SA after the LLMInferenceService is applied.
 # Wait for it, then patch it with the pull secret and restart the pods.
 info() { echo "==> $*"; }
-info "Waiting for SA autoscaling-example-llama-epp-sa to exist..."
+
+SA="qwen2-7b-instruct-pd-epp-sa"
+
+info "Waiting for SA $SA to exist..."
 timeout=120; elapsed=0
-while ! kubectl get sa autoscaling-example-llama-epp-sa -n autoscaling-example &>/dev/null; do
+while ! kubectl get sa $SA -n autoscaling-example &>/dev/null; do
     if [ "$elapsed" -ge "$timeout" ]; then
-        echo "ERROR: timed out waiting for SA autoscaling-example-llama-epp-sa"
+        echo "ERROR: timed out waiting for SA $SA"
         exit 1
     fi
     sleep 3
     elapsed=$((elapsed + 3))
 done
-oc patch sa autoscaling-example-llama-epp-sa -n autoscaling-example \
+oc patch sa $SA -n autoscaling-example \
     -p '{"imagePullSecrets": [{"name": "rhoai-operator-pull-secret"}]}' --type=merge
 sleep 10
 kubectl delete pods -l app.kubernetes.io/component=llminferenceservice-workload -n autoscaling-example --ignore-not-found

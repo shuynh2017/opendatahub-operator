@@ -10,8 +10,8 @@ kubectl create secret docker-registry rhoai-operator-pull-secret -n autoscaling-
     --from-file=.dockerconfigjson=$HOME/.config/containers/auth.json \
     --dry-run=client -o yaml | kubectl apply -f -
 
-kubectl apply -f "$DIR/08b-gateway.yaml"
-kubectl apply -f "$DIR/08c-llmisvc.yaml"
+kubectl apply -f "$DIR/08b-gateway-default.yaml"
+kubectl apply -f "$DIR/08c-llmisvc-cpu-default-gw.yaml"
 
 # The llmisvc controller creates the SA after the LLMInferenceService is applied.
 # Wait for it, then patch it with the pull secret and restart the pods.

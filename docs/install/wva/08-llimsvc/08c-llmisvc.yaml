@@ -10,15 +10,7 @@ metadata:
     security.opendatahub.io/enable-auth: 'false'
 spec:
   router:
-    scheduler: # {}
-      template:
-        imagePullSecrets:
-          - name: rhoai-operator-pull-secret
-        containers:
-          - name: main
-            # image: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9@sha256:9ec7153a4f17156e12810e02c6f50e8d2e9ccefa893150187b4cf3f1d1112d6e # quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9:rhoai-3.4
-            image: quay.io/rhoai/odh-llm-d-inference-scheduler-rhel9:rhoai-3.4
-            imagePullPolicy: Always
+    scheduler: {}
     route: {}
     gateway:
       refs: # Reference the gateway we created
@@ -39,7 +31,8 @@ spec:
   template:
     containers:
       - name: main
-        image: quay.io/aipcc/rhaiis/cuda-ubi9:3.4.0 # If using Accelerators, use the corresponding inference-image
+        image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.2-1782155603
+        #image: registry.redhat.io/rhaii-early-access/vllm-cuda-rhel9:3.5.0-ea.2-1782953356
         env: # DO NOT INCLUDE THIS - for testing only
           - name: HF_OFFLINE_HUB # DO NOT INCLUDE THIS - for testing only
             value: "1" # DO NOT INCLUDE THIS - for testing only

@@ -1,4 +1,4 @@
-apiVersion: serving.kserve.io/v1alpha1
+apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
   name: autoscaling-example-llama
@@ -11,10 +11,7 @@ spec:
   router:
     scheduler: {}
     route: {}
-    gateway:
-      refs: # Reference the gateway we created
-      - name: autoscaling-example-gateway
-        namespace: autoscaling-example
+    gateway: {}
   model:
     name: "unsloth/Meta-Llama-3.1-8B"
     uri: "hf://unsloth/Meta-Llama-3.1-8B"
